@@ -14,7 +14,8 @@ from urllib.parse import urlparse
 
 
 BASE_DIR = Path(__file__).resolve().parent
-SOURCE_DIR = BASE_DIR / "sorting files original"
+WORKING_DIR = BASE_DIR
+ORIGINAL_DIR = BASE_DIR / "sorting files original"
 ENCODING = "cp1252"
 DELIMITER = ";"
 
@@ -33,6 +34,16 @@ STORAGE_PREFIX_ALIASES = {
     "UP": "ÜP",
     "AKF1": "ÜB1",
     "AKF2": "ÜB2",
+}
+
+STORAGE_PREFIX_OVERRIDES = {
+    "KID": "EK1",
+    "SPN": "SP1",
+    "WER": "WER",
+}
+
+STORAGE_NAME_ALIASES = {
+    "UBEK": STORAGE_PREFIX_ALIASES["AKF1"],
 }
 
 
@@ -61,15 +72,30 @@ def set_cell(row: list[str], index: int, value: str, width: int) -> None:
     row[index] = value
 
 
+def sorting_file_paths() -> list[Path]:
+    current_by_name = {path.name: path for path in WORKING_DIR.glob("*.csv")}
+    original_by_name = {path.name: path for path in ORIGINAL_DIR.glob("*.csv")}
+    names = sorted(set(current_by_name) | set(original_by_name))
+    return [current_by_name.get(name) or original_by_name[name] for name in names]
+
+
 def load_sorting_files() -> list[SortingFile]:
     files: list[SortingFile] = []
-    for path in sorted(SOURCE_DIR.glob("*.csv")):
+    for path in sorting_file_paths():
         with path.open("r", encoding=ENCODING, newline="") as handle:
             reader = csv.reader(handle, delimiter=DELIMITER)
             header = next(reader)
             rows = [normalize_width(row, len(header)) for row in reader]
         files.append(SortingFile(path, header, rows))
     return files
+
+
+def save_sorting_files(files: list[SortingFile]) -> None:
+    for file in files:
+        with (WORKING_DIR / file.name).open("w", encoding=ENCODING, newline="") as handle:
+            writer = csv.writer(handle, delimiter=DELIMITER, lineterminator="\r\n")
+            writer.writerow(file.header)
+            writer.writerows(file.rows)
 
 
 def normalize_width(row: list[str], width: int) -> list[str]:
@@ -96,7 +122,9 @@ def parse_bin(bin_name: str) -> dict[str, Any]:
     if storage:
         prefix, coordinate, level, slot = storage.groups()
         coordinate_number = int(coordinate)
-        if prefix in {"MUS", "SPN"}:
+        if prefix in STORAGE_PREFIX_OVERRIDES:
+            storage_type = STORAGE_PREFIX_OVERRIDES[prefix]
+        elif prefix == "MUS":
             storage_type = prefix
         else:
             storage_type = f"{prefix}{coordinate[0]}"
@@ -137,7 +165,7 @@ def parse_bin(bin_name: str) -> dict[str, Any]:
     return {
         "kind": "generic",
         "prefix": re.match(r"^[A-Z]+", compact).group(0) if re.match(r"^[A-Z]+", compact) else "",
-        "storage_type": "",
+        "storage_type": STORAGE_NAME_ALIASES.get(compact, ""),
         "sort_key": (99, natural_parts(compact)),
     }
 
@@ -145,8 +173,6 @@ def parse_bin(bin_name: str) -> dict[str, Any]:
 def infer_storage_type(bin_name: str) -> str:
     parsed = parse_bin(bin_name)
     storage_type = parsed.get("storage_type") or ""
-    if storage_type.startswith("SPN"):
-        return "SPN"
     return storage_type
 
 
@@ -236,7 +262,8 @@ def file_accepts_bin(file: SortingFile, bin_name: str, selected_files: set[str] 
         return False
     candidates = {storage_type, f"{storage_type}P"}
     return any(
-        cell(row, COL_STORAGE_TYPE) in candidates or cell(row, COL_ACTIVITY_AREA) in candidates
+        cell(row, COL_STORAGE_TYPE) in candidates
+        or (not cell(row, COL_STORAGE_TYPE) and cell(row, COL_ACTIVITY_AREA) in candidates)
         for row in file.data_rows
     )
 
@@ -274,6 +301,7 @@ def build_new_row(file: SortingFile, bin_name: str) -> tuple[list[str], int, lis
 def apply_bins(files: list[SortingFile], bins: list[str], selected_files: set[str] | None = None) -> tuple[list[SortingFile], list[dict[str, Any]]]:
     cloned = [SortingFile(file.path, file.header[:], [row[:] for row in file.rows]) for file in files]
     changes: list[dict[str, Any]] = []
+    updated_files: set[str] = set()
     existing_by_file = {file.name: {canonical_bin_key(cell(row, COL_BIN)) for row in file.data_rows} for file in cloned}
 
     for bin_name in bins:
@@ -289,6 +317,7 @@ def apply_bins(files: list[SortingFile], bins: list[str], selected_files: set[st
             row, insert_at, template = build_new_row(file, normalized_bin)
             file.rows.insert(insert_at, row)
             existing_by_file[file.name].add(canonical_bin_key(normalized_bin))
+            updated_files.add(file.name)
             changes.append({
                 "file": file.name,
                 "bin": normalized_bin,
@@ -299,7 +328,8 @@ def apply_bins(files: list[SortingFile], bins: list[str], selected_files: set[st
                 "templateBin": cell(template, COL_BIN) if template else "",
             })
     for file in cloned:
-        renumber(file)
+        if file.name in updated_files:
+            renumber(file)
     return cloned, changes
 
 
@@ -348,6 +378,10 @@ def make_zip(files: list[SortingFile]) -> bytes:
     return archive.getvalue()
 
 
+def updated_file_names(changes: list[dict[str, Any]]) -> list[str]:
+    return ordered_unique(change["file"] for change in changes if change.get("action") == "inserted")
+
+
 def parse_bins(payload: dict[str, Any]) -> list[str]:
     raw = payload.get("bins", "")
     if isinstance(raw, list):
@@ -365,7 +399,8 @@ def rules_summary(files: list[SortingFile]) -> dict[str, Any]:
             if storage_type:
                 storage_map.setdefault(storage_type, set()).add(file.name)
     return {
-        "sourceDir": str(SOURCE_DIR),
+        "workingDir": str(WORKING_DIR),
+        "originalDir": str(ORIGINAL_DIR),
         "encoding": ENCODING,
         "delimiter": DELIMITER,
         "files": [summarize_file(file) for file in files],
@@ -398,7 +433,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json({"changes": changes, "files": [summarize_file(file) for file in changed]})
             return
         if parsed.path == "/api/export":
-            body = make_zip(changed)
+            export_names = set(updated_file_names(changes))
+            export_files = [file for file in changed if file.name in export_names]
+            save_sorting_files(export_files)
+            body = make_zip(export_files)
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", 'attachment; filename="ewm-sorting-export.zip"')
@@ -669,9 +707,10 @@ INDEX_HTML = r"""
       if (!changes.length) return 'Keine passenden neuen Bins gefunden.';
       const inserted = changes.filter(change => change.action === 'inserted').length;
       const skipped = changes.length - inserted;
-      const files = new Set(changes.map(change => change.file)).size;
+      const files = new Set(changes.filter(change => change.action === 'inserted').map(change => change.file)).size;
       const mode = manualFiles ? 'manuelle Dateiauswahl' : 'Auto-Routing';
-      return `${inserted} Einf\u00fcgung(en) in ${files} Datei(en) per ${mode}. ${skipped ? skipped + ' bereits vorhandene Eintr\u00e4ge \u00fcbersprungen.' : 'Beim Export werden die Sequenzen je Datei neu berechnet.'}`;
+      if (!inserted) return `${skipped} bereits vorhandene Eintr\u00e4ge \u00fcbersprungen. Der Export enth\u00e4lt keine Dateien.`;
+      return `${inserted} Einf\u00fcgung(en) in ${files} Datei(en) per ${mode}. ${skipped ? skipped + ' bereits vorhandene Eintr\u00e4ge \u00fcbersprungen.' : 'Beim Export werden nur aktualisierte Dateien ausgegeben.'}`;
     }
 
     function renderPreview(changes, manualFiles) {
@@ -682,7 +721,7 @@ INDEX_HTML = r"""
       }
 
       const inserted = changes.filter(change => change.action === 'inserted').length;
-      const files = new Set(changes.map(change => change.file)).size;
+      const files = new Set(changes.filter(change => change.action === 'inserted').map(change => change.file)).size;
       const grouped = groupBy(changes, change => change.bin);
       $('previewCards').className = '';
       $('previewCards').innerHTML = `
